@@ -143,6 +143,7 @@ pub use es_entity;
 
 mod ledger;
 pub mod outbox;
+pub mod rollup;
 
 pub use ledger::*;
 

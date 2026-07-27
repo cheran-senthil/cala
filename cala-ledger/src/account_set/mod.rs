@@ -14,6 +14,11 @@ use error::*;
 use repo::*;
 pub use repo::{account_set_cursor::*, members_cursor::*};
 
+/// Page size for enumerating eventually-consistent set ids in
+/// [`AccountSets::recalculate_all_eventually_consistent`]: bounds the working
+/// set per round-trip while keeping the number of queries small.
+const EC_RECALC_PAGE_SIZE: usize = 1_000;
+
 #[derive(Clone)]
 pub struct AccountSets {
     repo: AccountSetRepo,
@@ -641,6 +646,42 @@ impl AccountSets {
         Ok(())
     }
 
+    /// Streaming EC-rollup entry point: bring the eventually-consistent sets
+    /// that have `member_account_id` as a (transitive) member up to date, in
+    /// the caller's operation.
+    ///
+    /// This is the fold the outbox consumer runs on each leaf balance event. It
+    /// reuses [`Self::recalculate_balances_batch_in_op`] verbatim — same
+    /// coalesced fold, same watermark, same per-set lock discipline — so the
+    /// streaming path inherits the batch path's concurrency correctness. The
+    /// event is only a doorbell; the watermark inside the recalc decides what
+    /// (if anything) to fold, which makes re-delivery a no-op.
+    ///
+    /// Returns the EC sets that were caught up (empty when `member_account_id`
+    /// has no EC ancestors — e.g. a set account, or a leaf in only non-EC sets).
+    #[instrument(
+        name = "cala_ledger.account_sets.recalculate_ec_ancestors_in_op",
+        skip(self, op),
+        fields(member_account_id = %member_account_id, n_ec_ancestors)
+    )]
+    pub async fn recalculate_ec_ancestors_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        member_account_id: AccountId,
+    ) -> Result<Vec<AccountSetId>, AccountSetError> {
+        let ec_ancestor_ids = self
+            .repo
+            .find_ec_ancestor_ids_in_op(op, member_account_id)
+            .await?;
+        tracing::Span::current().record("n_ec_ancestors", ec_ancestor_ids.len());
+        if ec_ancestor_ids.is_empty() {
+            return Ok(ec_ancestor_ids);
+        }
+        self.recalculate_balances_batch_in_op(op, &ec_ancestor_ids)
+            .await?;
+        Ok(ec_ancestor_ids)
+    }
+
     /// Recalculate balances for the given account sets **and** all their
     /// descendant account sets in a single batch.
     #[instrument(
@@ -693,6 +734,47 @@ impl AccountSets {
         }
 
         self.recalculate_balances_batch_in_op(op, &all_ids).await
+    }
+
+    /// Reconcile **every** eventually-consistent account set from scratch, in
+    /// one operation. This is the batch backstop the streaming consumer demotes
+    /// but does not replace: use it to seed EC watermarks on first rollout,
+    /// as a disaster-recovery repair if the consumer was ever disabled or fell
+    /// irreparably behind, and as the oracle in tests.
+    ///
+    /// It pages through `list_eventually_consistent_ids` and runs
+    /// `recalculate_balances_deep` over the whole set. Idempotent: watermarks
+    /// only advance, so re-running folds nothing new. Returns the number of EC
+    /// sets reconciled.
+    #[instrument(
+        name = "cala_ledger.account_sets.recalculate_all_eventually_consistent",
+        skip(self),
+        fields(n_ec_sets)
+    )]
+    pub async fn recalculate_all_eventually_consistent(&self) -> Result<usize, AccountSetError> {
+        let mut all_ids: Vec<AccountSetId> = Vec::new();
+        let mut after: Option<AccountSetByIdCursor> = None;
+        loop {
+            let page = self
+                .list_eventually_consistent_ids(es_entity::PaginatedQueryArgs {
+                    first: EC_RECALC_PAGE_SIZE,
+                    after: after.take(),
+                })
+                .await?;
+            all_ids.extend(page.entities);
+            if !page.has_next_page {
+                break;
+            }
+            after = page.end_cursor;
+        }
+        tracing::Span::current().record("n_ec_sets", all_ids.len());
+        if all_ids.is_empty() {
+            return Ok(0);
+        }
+        // `recalculate_balances_deep` already expands to EC descendants and
+        // dedups, so passing the full EC-root list reconciles the whole forest.
+        self.recalculate_balances_deep(&all_ids).await?;
+        Ok(all_ids.len())
     }
 
     /// List the ids of all account sets that are marked as

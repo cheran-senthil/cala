@@ -916,6 +916,43 @@ impl AccountSetRepo {
         })
     }
 
+    /// Reverse membership lookup for the streaming EC-rollup consumer: given a
+    /// leaf `member_account_id`, return the **eventually-consistent** account
+    /// sets that have it as a member.
+    ///
+    /// `cala_account_set_member_accounts` is a **transitive closure** keyed
+    /// `UNIQUE(account_set_id, member_account_id)`: when a leaf is added, a row
+    /// is written for the set *and every ancestor set*, and a leaf reachable by
+    /// multiple paths is stored once. So this single indexed query returns all
+    /// transitive EC ancestors (no graph walk) and cannot double-count in a
+    /// diamond. `member_account_id` is always a leaf account, so a set account
+    /// passed here yields zero rows — set-republished balance events are
+    /// harmless no-ops.
+    #[instrument(
+        name = "account_set.find_ec_ancestor_ids_in_op",
+        skip_all,
+        err(level = "warn")
+    )]
+    pub(super) async fn find_ec_ancestor_ids_in_op(
+        &self,
+        op: &mut impl es_entity::AtomicOperation,
+        member_account_id: AccountId,
+    ) -> Result<Vec<AccountSetId>, AccountSetError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT m.account_set_id AS "account_set_id!: AccountSetId"
+            FROM cala_account_set_member_accounts m
+            JOIN cala_accounts a ON a.id = m.account_set_id
+            WHERE m.member_account_id = $1
+              AND a.eventually_consistent = TRUE
+            "#,
+            member_account_id as AccountId,
+        )
+        .fetch_all(op.as_executor())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.account_set_id).collect())
+    }
+
     /// Walk the descendant account sets of `account_set_ids` transitively
     /// and return the ones whose underlying account is
     /// `eventually_consistent = TRUE`. Non-EC descendants are filtered
