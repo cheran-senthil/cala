@@ -3,6 +3,7 @@ pub mod error;
 
 use es_entity::clock::ClockHandle;
 use sqlx::PgPool;
+use std::sync::Arc;
 pub use tracing::instrument;
 use tracing::Instrument;
 
@@ -17,6 +18,7 @@ use crate::{
     journal::Journals,
     outbox::OutboxPublisher,
     primitives::TransactionId,
+    rollup::EcRollupHandler,
     transaction::{Transaction, Transactions},
     tx_template::{Params, TxTemplates},
     velocity::Velocities,
@@ -35,6 +37,11 @@ pub struct CalaLedger {
     velocities: Velocities,
     balances: Balances,
     publisher: OutboxPublisher,
+    /// Present only when `ec_rollup_streaming` is enabled. Owns the background
+    /// job that streams balance events and catches up EC account sets. Wrapped
+    /// in `Arc` because `CalaLedger` is `Clone` but `Jobs` is not; `shutdown`
+    /// takes `&self`, so the `Arc` is sufficient.
+    jobs: Option<Arc<job::Jobs>>,
 }
 
 impl CalaLedger {
@@ -72,6 +79,34 @@ impl CalaLedger {
         let balances = Balances::new(&pool, &publisher, &journals);
         let velocities = Velocities::new(&pool, &clock);
         let account_sets = AccountSets::new(&pool, &publisher, &accounts, &balances, &clock);
+
+        // Boot the streaming EC-rollup consumer when enabled. It hosts an
+        // outbox event handler as a durable `job`; the job's cursor is tracked
+        // in `job_executions`, so it resumes gaplessly across restarts. The
+        // job tables were created by the ledger migrations, so the job service
+        // must NOT run its own migrations here.
+        let jobs = if config.ec_rollup_streaming {
+            let job_config = job::JobSvcConfig::builder()
+                .pool(pool.clone())
+                .clock(clock.clone())
+                .build()
+                .map_err(|e| LedgerError::ConfigError(e.to_string()))?;
+            let mut jobs = job::Jobs::init(job_config).await?;
+            publisher
+                .inner()
+                .register_event_handler(
+                    &mut jobs,
+                    crate::rollup::job_config(),
+                    EcRollupHandler::new(account_sets.clone()),
+                )
+                .await
+                .map_err(|e| LedgerError::EcRollup(e.to_string()))?;
+            jobs.start_poll().await?;
+            Some(Arc::new(jobs))
+        } else {
+            None
+        };
+
         Ok(Self {
             accounts,
             account_sets,
@@ -84,7 +119,18 @@ impl CalaLedger {
             velocities,
             pool,
             clock,
+            jobs,
         })
+    }
+
+    /// Gracefully stop the streaming EC-rollup consumer (if running). No-op when
+    /// `ec_rollup_streaming` was not enabled. Safe to call on a clone — all
+    /// clones share the same underlying `Jobs`.
+    pub async fn shutdown(&self) -> Result<(), LedgerError> {
+        if let Some(jobs) = &self.jobs {
+            jobs.shutdown().await?;
+        }
+        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {

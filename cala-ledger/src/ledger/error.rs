@@ -34,6 +34,10 @@ pub enum LedgerError {
     BalanceError(#[from] BalanceError),
     #[error("LedgerError - VelocityError: {0}")]
     VelocityError(#[from] VelocityError),
+    #[error("LedgerError - JobError: {0}")]
+    JobError(#[from] job::error::JobError),
+    #[error("LedgerError - EcRollup: {0}")]
+    EcRollup(String),
 }
 
 impl From<sqlx::Error> for LedgerError {

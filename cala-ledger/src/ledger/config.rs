@@ -10,6 +10,12 @@ pub struct CalaLedgerConfig {
     pub(super) max_connections: Option<u32>,
     #[builder(default)]
     pub(super) exec_migrations: bool,
+    /// When true, `CalaLedger::init` boots a background job that streams ledger
+    /// balance events from the outbox and incrementally catches up
+    /// eventually-consistent account sets (replacing pull-based batch recalc).
+    /// Default off, so existing embedders/tests are unchanged.
+    #[builder(default)]
+    pub(super) ec_rollup_streaming: bool,
     #[builder(setter(into, strip_option), default)]
     pub(super) pool: Option<sqlx::PgPool>,
     #[builder(setter(into), default = "Clock::handle().clone()")]
